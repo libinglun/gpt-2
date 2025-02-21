@@ -6,10 +6,10 @@ from torch.nn import functional as F
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    window_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 12
-    n_head: int = 6
+    n_head: int = 12
     n_embed: int = 768    # n_embed = d_model = n_head * head_size = 12 * 64 = 768
 
 class CausalSelfAttention(nn.Module):
@@ -24,8 +24,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embed = config.n_embed
         
-        self.register_buffer('mask', torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        self.register_buffer('mask', torch.tril(torch.ones(config.window_size, config.window_size))
+                                        .view(1, 1, config.window_size, config.window_size))
 
 
     def forward(self, x):
@@ -66,9 +66,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.layer_norm1 = nn.LayerNorm(config.n_embed)
+        self.ln_1 = nn.LayerNorm(config.n_embed)
         self.attn = CausalSelfAttention(config)
-        self.layer_norm2 = nn.LayerNorm(config.n_embed)
+        self.ln_2 = nn.LayerNorm(config.n_embed)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -77,8 +77,8 @@ class Block(nn.Module):
         # residue wouldn't pass through the layer norm
         # attn -> reduce, mlp -> map: Transformer -> repeated application of map-reduce
         #-----------------------------------------------------------------------------------#
-        x = x + self.attn(self.layer_norm1(x))  
-        x = x + self.mlp(self.layer_norm2(x))
+        x = x + self.attn(self.ln_1(x))  
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 
@@ -88,11 +88,47 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        self.transformer = nn.ModuleList(dict(
-            token_embedding_weights = nn.Embedding(config.vocab_size, config.n_embed),
-            position_embedding_weights = nn.Embedding(config.block_size, config.n_embed),
-            hidden_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            layer_norm = nn.LayerNorm(config.n_embed),
+        self.transformer = nn.ModuleDict(dict(
+            tok_emb = nn.Embedding(config.vocab_size, config.n_embed),
+            pos_emb = nn.Embedding(config.window_size, config.n_embed),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embed),
         ))
 
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+
+    @classmethod
+    def from_pretrained(cls):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt2 (124M)")
+
+        config = GPTConfig()
+        model = GPT(config)
+        state_dict = model.state_dict()
+        keys = state_dict.keys()
+        keys = [k for k in keys if not k.endswith('.attn.mask')] # discard this mask / buffer, not a param
+
+        model_pretrained = GPT2LMHeadModel.from_pretrained("gpt2")
+        state_dict_pretrained = model_pretrained.state_dict()
+
+        keys_pretrained = state_dict_pretrained.keys()
+        keys_pretrained = [k for k in keys_pretrained if not k.endswith('.attn.masked_bias')]   
+        keys_pretrained = [k for k in keys_pretrained if not k.endswith('.attn.bias')]          
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        
+        assert len(keys_pretrained) == len(keys_pretrained), f"mismatched keys: {len(keys_pretrained)} != {len(keys)}"
+
+        for k in keys_pretrained:
+            if any(k.endswith(w) for w in transposed):
+                assert state_dict_pretrained[k].shape[::-1] == state_dict[k].shape
+                with torch.no_grad():
+                    state_dict[k].copy_(state_dict_pretrained[k].t())
+            else:
+                assert state_dict_pretrained[k].shape == state_dict[k].shape
+                with torch.no_grad():
+                    state_dict[k].copy_(state_dict_pretrained[k])
+
+        return model
