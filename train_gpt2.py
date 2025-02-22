@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 import math
-import torch 
+import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
 
 @dataclass
 class GPTConfig:
@@ -12,6 +13,7 @@ class GPTConfig:
     n_head: int = 12
     n_embed: int = 768    # n_embed = d_model = n_head * head_size = 12 * 64 = 768
 
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -19,14 +21,13 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embed % config.n_head == 0
 
         self.W_qkv = nn.Linear(config.n_embed, config.n_embed * 3)
-        self.W_o = nn.Linear(config.n_embed, config.n_embed) 
+        self.W_o = nn.Linear(config.n_embed, config.n_embed)
 
         self.n_head = config.n_head
         self.n_embed = config.n_embed
-        
+
         self.register_buffer('mask', torch.tril(torch.ones(config.window_size, config.window_size))
                                         .view(1, 1, config.window_size, config.window_size))
-
 
     def forward(self, x):
         batch_size, seq_len, embed_dim = x.size()
@@ -45,7 +46,7 @@ class CausalSelfAttention(nn.Module):
         V_attn = V_attn.transpose(1, 2).contiguous.view(batch_size, seq_len, embed_dim)             # (batch_size, seq_len, embed_dim)
         O_attn = self.W_o(V_attn)                                                                   # (batch_size, seq_len, embed_dim)
 
-        return O_attn                                                            
+        return O_attn
 
 
 class MLP(nn.Module):
@@ -53,7 +54,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.fc = nn.Linear(config.n_embed, config.n_embed * 4)
-        self.gelu = nn.GELU(approximate='tanh')    # don't need apprxoximate anymore
+        self.gelu = nn.GELU(approximate='tanh')    # don't need to approximate anymore
         self.proj = nn.Linear(config.n_embed * 4, config.n_embed)
 
     def forward(self, x):
@@ -61,6 +62,7 @@ class MLP(nn.Module):
         x = self.gelu(x)
         x = self.proj(x)
         return x
+
 
 class Block(nn.Module):
 
@@ -77,7 +79,7 @@ class Block(nn.Module):
         # residue wouldn't pass through the layer norm
         # attn -> reduce, mlp -> map: Transformer -> repeated application of map-reduce
         #-----------------------------------------------------------------------------------#
-        x = x + self.attn(self.ln_1(x))  
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -91,8 +93,8 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             tok_emb = nn.Embedding(config.vocab_size, config.n_embed),
             pos_emb = nn.Embedding(config.window_size, config.n_embed),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embed),
+            h       = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f    = nn.LayerNorm(config.n_embed),
         ))
 
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
@@ -113,12 +115,12 @@ class GPT(nn.Module):
         state_dict_pretrained = model_pretrained.state_dict()
 
         keys_pretrained = state_dict_pretrained.keys()
-        keys_pretrained = [k for k in keys_pretrained if not k.endswith('.attn.masked_bias')]   
-        keys_pretrained = [k for k in keys_pretrained if not k.endswith('.attn.bias')]          
+        keys_pretrained = [k for k in keys_pretrained if not k.endswith('.attn.masked_bias')]
+        keys_pretrained = [k for k in keys_pretrained if not k.endswith('.attn.bias')]
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        
+
         assert len(keys_pretrained) == len(keys_pretrained), f"mismatched keys: {len(keys_pretrained)} != {len(keys)}"
 
         for k in keys_pretrained:

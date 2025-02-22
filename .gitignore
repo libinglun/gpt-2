@@ -1,6 +1,7 @@
 # myself
 gpt2-env/
 reference.ipynb
+.idea/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
