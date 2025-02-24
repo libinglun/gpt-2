@@ -1,6 +1,6 @@
 # myself
 gpt2-env/
-reference.ipynb
+*.ipynb
 .idea/
 
 # Byte-compiled / optimized / DLL files

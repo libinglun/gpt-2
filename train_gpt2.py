@@ -20,8 +20,8 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embed % config.n_head == 0
 
-        self.W_qkv = nn.Linear(config.n_embed, config.n_embed * 3)
-        self.W_o = nn.Linear(config.n_embed, config.n_embed)
+        self.c_attn = nn.Linear(config.n_embed, config.n_embed * 3)
+        self.c_proj = nn.Linear(config.n_embed, config.n_embed)
 
         self.n_head = config.n_head
         self.n_embed = config.n_embed
@@ -32,7 +32,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         batch_size, seq_len, embed_dim = x.size()
 
-        q, k, v = self.W_qkv(x).split(self.n_embed, dim=-1)
+        q, k, v = self.c_attn(x).split(self.n_embed, dim=-1)
 
         q = q.view(batch_size, seq_len, self.n_head, self.n_embed // self.n_head).transpose(1, 2)   # (batch_size, n_head, seq_len, head_size)
         k = k.view(batch_size, seq_len, self.n_head, self.n_embed // self.n_head).transpose(1, 2)   # (batch_size, n_head, seq_len, head_size)
@@ -43,8 +43,8 @@ class CausalSelfAttention(nn.Module):
         W_attn = F.softmax(W_attn, dim=-1)                                                          # (batch_size, n_head, seq_len, seq_len)
 
         V_attn = W_attn @ v                                                                         # (batch_size, n_head, seq_len, head_size)
-        V_attn = V_attn.transpose(1, 2).contiguous.view(batch_size, seq_len, embed_dim)             # (batch_size, seq_len, embed_dim)
-        O_attn = self.W_o(V_attn)                                                                   # (batch_size, seq_len, embed_dim)
+        V_attn = V_attn.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)             # (batch_size, seq_len, embed_dim)
+        O_attn = self.c_proj(V_attn)                                                                   # (batch_size, seq_len, embed_dim)
 
         return O_attn
 
@@ -53,14 +53,14 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.fc = nn.Linear(config.n_embed, config.n_embed * 4)
+        self.c_fc = nn.Linear(config.n_embed, config.n_embed * 4)
         self.gelu = nn.GELU(approximate='tanh')    # don't need to approximate anymore
-        self.proj = nn.Linear(config.n_embed * 4, config.n_embed)
+        self.c_proj = nn.Linear(config.n_embed * 4, config.n_embed)
 
     def forward(self, x):
-        x = self.fc(x)
+        x = self.c_fc(x)
         x = self.gelu(x)
-        x = self.proj(x)
+        x = self.c_proj(x)
         return x
 
 
@@ -91,13 +91,31 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            tok_emb = nn.Embedding(config.vocab_size, config.n_embed),
-            pos_emb = nn.Embedding(config.window_size, config.n_embed),
+            wte = nn.Embedding(config.vocab_size, config.n_embed),
+            wpe = nn.Embedding(config.window_size, config.n_embed),
             h       = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f    = nn.LayerNorm(config.n_embed),
         ))
 
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+
+    def forward(self, x):
+        B, T = x.size()
+        assert T <= self.config.window_size, f"Sequence length is too long: {T} > {self.config.window_size}"
+
+        pos = torch.arange(0, T, dtype=torch.long, device=x.device)
+        pos_emb = self.transformer.wpe(pos)     # (T, n_embed)
+        tok_emb = self.transformer.wte(x)       # (B, T, n_embed)
+        x = tok_emb + pos_emb                   # (B, T, n_embed)
+
+        for block in self.transformer.h:
+            x = block(x)
+
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)                # (B, T, vocab_size)
+
+        return logits
+
 
     @classmethod
     def from_pretrained(cls):
@@ -134,3 +152,40 @@ class GPT(nn.Module):
                     state_dict[k].copy_(state_dict_pretrained[k])
 
         return model
+
+
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+num_seq = 5
+max_len = 30
+
+# model = GPT.from_pretrained()
+# print("pretrained models are successfully loaded")
+
+model = GPT(GPTConfig())
+model.eval().to(device)
+
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+print(tokens)
+tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_seq, 1).to(device)
+
+torch.manual_seed(42)
+while tokens.size(1) < max_len:
+    with torch.no_grad():
+        logits = model(tokens)[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        ix = torch.multinomial(topk_probs, 1)
+        next_tokens = torch.gather(topk_indices, -1, ix)                 # (num_seq, 1)
+        tokens = torch.cat((tokens, next_tokens), dim=-1)
+
+for i in range(num_seq):
+    print(">", enc.decode(tokens[i].tolist()))
+
